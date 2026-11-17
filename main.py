@@ -1,189 +1,186 @@
-"""GTA VI launch-day Twitch viewership forecaster.
+"""Forecast GTA VI's launch-day Twitch audience, hour by hour.
 
-Forecasts, hour by hour, how many people watch Grand Theft Auto VI live on
-Twitch over the 24 UTC hours of its release day, 2026-11-19, from everything
-recorded up to the end of the day's first hour. For each of hours 2 to 24 it
-writes five quantiles (5%, 25%, 50%, 75%, 95%) of that hour's viewer count.
+For each hour of the release day after the first, this program writes five
+quantiles (5%, 25%, 50%, 75%, 95%) of the concurrent viewers in the game's
+Twitch category. It learns the shape of a launch day from past big game
+launches supplied in the case file, then scales that shape by the case's own
+hour-1 print.
 
-Method: the launch-day shape of past big game launches.
-  - Every comparable launch in the case file contributes its release-day
-    hourly curve (hours 1..24 of its UTC release day, from SullyGnome's
-    hourly Twitch category averages). A launch counts only when its UTC
-    hour 1 is a genuine unlock hour: its hour-1 print is at least 3% of
-    that day's peak, with at least 12 of the 24 hours present. This drops
-    simultaneous-global launches (unlock at 14:00Z and the like), whose
-    UTC hour 1 is pre-unlock noise and whose later ratios explode.
-  - For each hour h, the forecast is built from the log-ratios
-    ln(viewers_h / viewers_1) across the kept launches, weighted by how
-    close each launch's hour-1 size is to this case's hour-1 print:
-    weight = exp(-|ln(h1_launch) - ln(p1)| / 0.5). Launches of a similar
-    size shape the forecast most, because a mega-launch's day curve
-    behaves differently from a small launch's.
-  - The five quantiles are the weighted empirical quantiles of those
-    log-ratios at the case's levels, exponentiated back and scaled by
-    the case's own hour-1 print p1. The pinball loss is scored on the
-    log scale, so working in log space is the natural scale.
-  - The target game's own category history (a comparable that names the
-    same game) is excluded: it is the pre-release history, not a launch
-    day, and would poison the shape pool.
-  - If no launch qualifies for an hour, the forecast falls back to a
-    flat persistence forecast whose spread widens like a random walk
-    over the day.
+How the shape is learned:
+  * Every comparable launch contributes its release-day hourly curve: the
+    viewers in hours 1..24 of its UTC release day.
+  * A launch is kept only when its UTC hour 1 is a real unlock hour -- its
+    hour-1 viewers are at least 3% of that day's peak, and at least 12 of
+    the 24 hours are present. Launches that unlocked all at once later in
+    the day (a 14:00Z global unlock, say) have a near-empty hour 1 and a
+    huge later jump, so their ratios would poison the pool.
+  * The target game's own category history is left out: it is pre-release
+    traffic, not a launch day.
+  * For each hour, the forecast comes from the log-ratios
+    ln(viewers_h / viewers_1) across the kept launches, weighted by size
+    similarity: a launch whose hour-1 audience is close to this case's
+    hour-1 print counts most, with weight
+    exp(-|ln(launch hour 1) - ln(p1)| / 0.5). Big launches behave
+    differently from small ones, so size-matched launches are the best
+    teachers.
+  * The five quantiles are the weighted empirical quantiles of those
+    log-ratios at the case's levels, exponentiated and scaled by p1. The
+    contest scores on the log scale, so log space is the natural scale.
+  * When no launch qualifies for an hour, the program falls back to
+    holding at the hour-1 print with a spread that widens like a random
+    walk through the day.
 
-Local validation (practice cases, scored against SullyGnome's real
-hourly averages): pinball loss 0.237, against the house persistence
-baseline's 0.387. Leave-one-out over the comparables: 0.274 vs 0.359.
-
-Runs with the standard library only, no network, deterministic: the same
-input bytes always produce the same output bytes.
+Standard library only, no network, deterministic: the same input bytes
+always produce the same output bytes.
 """
 
 import json
 import math
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
-# How close a comparable launch's hour-1 size must be to the case's hour-1
-# print to carry full weight, in natural-log units.
-SIZE_BANDWIDTH = 0.5
-# A launch's UTC hour 1 must be at least this share of its own day peak to
+# A comparable's hour-1 size must be within this many log units of the
+# case's hour-1 print to carry full weight.
+SIZE_SCALE = 0.5
+# Hour 1 must reach at least this share of the launch's own day peak to
 # count as a genuine unlock hour.
-MIN_HOUR1_FRACTION = 0.03
-# A launch needs at least this many of the 24 release-day hours present.
-MIN_DAY_HOURS = 12
+HOUR1_MIN_SHARE = 0.03
+# A launch needs at least this many release-day hours present.
+DAY_MIN_HOURS = 12
+# Fallback spread: log units per square-root hour.
+FALLBACK_SIGMA = 0.15
+# Standard normal quantiles at the scored levels, for the fallback.
+NORMAL_Q = {0.05: -1.645, 0.25: -0.674, 0.5: 0.0, 0.75: 0.674, 0.95: 1.645}
 
 
-def parse_time(text):
-    """Parse an ISO 8601 UTC timestamp into an aware datetime."""
+def parse_when(text):
+    """ISO 8601 UTC timestamp -> aware datetime."""
     return datetime.fromisoformat(text.replace("Z", "+00:00"))
 
 
-def log_viewers(value):
-    """Natural log of a viewer count, with the contest's floor of 1."""
+def safe_log(value):
+    """Natural log of a viewer count; the contest floors counts at 1."""
     return math.log(max(1.0, float(value)))
 
 
-def weighted_quantile(pairs, level):
-    """Weighted quantile of (value, weight) pairs at the given level.
+def day_curve(launch):
+    """Hourly viewers for hours 1..24 of a launch's UTC release day.
 
-    Pairs are sorted by value; the quantile is the smallest value whose
-    cumulative weight reaches level * total weight.
+    The source samples sparsely for small categories, so only hours with
+    an actual point are returned; nothing is interpolated.
     """
-    total = sum(w for _, w in pairs)
-    if total <= 0:
-        return None
-    target = level * total
-    acc = 0.0
-    for value, weight in sorted(pairs):
-        acc += weight
-        if acc >= target:
-            return value
-    return sorted(pairs)[-1][0]
-
-
-def launch_day_curve(comparable):
-    """Hourly viewers for hours 1..24 of a comparable's UTC release day.
-
-    Returns a dict hour -> viewers, using only the hours the source
-    actually sampled (a small category is sampled sparsely; nothing is
-    interpolated).
-    """
-    day_start = parse_time(comparable["day_start"])
+    start = parse_when(launch["day_start"])
     curve = {}
-    for point in comparable.get("hourly", []):
+    for point in launch.get("hourly", []):
         viewers = point.get("viewers")
         if viewers is None:
             continue
-        when = parse_time(point["from"])
-        hour = int((when - day_start).total_seconds() // 3600) + 1
+        hour = int((parse_when(point["from"]) - start).total_seconds() // 3600) + 1
         if 1 <= hour <= 24:
             curve[hour] = viewers
     return curve
 
 
-def shape_pool(case):
-    """The launches that shape this case's forecast.
+def usable_launches(case):
+    """(shape, hour-1 viewers) for every comparable that can teach us.
 
-    Each entry is (log-ratio shape, hour-1 viewers): the shape maps each
-    forecast hour to ln(viewers_h / viewers_1) for that launch.
+    Shape maps each forecast hour to ln(viewers_h / viewers_1).
     """
-    target_name = (case.get("game") or {}).get("name")
-    pool = []
-    for comparable in case.get("comparables", []):
-        if comparable.get("name") == target_name:
+    own_name = (case.get("game") or {}).get("name")
+    kept = []
+    for launch in case.get("comparables", []):
+        if launch.get("name") == own_name:
             continue
-        curve = launch_day_curve(comparable)
-        if 1 not in curve or len(curve) < MIN_DAY_HOURS:
+        curve = day_curve(launch)
+        if 1 not in curve or len(curve) < DAY_MIN_HOURS:
             continue
-        if curve[1] < MIN_HOUR1_FRACTION * max(curve.values()):
+        if curve[1] < HOUR1_MIN_SHARE * max(curve.values()):
             continue
         first = max(1.0, float(curve[1]))
-        shape = {}
-        for hour in range(2, 25):
-            if hour in curve:
-                shape[hour] = log_viewers(curve[hour]) - math.log(first)
+        shape = {
+            hour: safe_log(curve[hour]) - math.log(first)
+            for hour in range(2, 25)
+            if hour in curve
+        }
         if shape:
-            pool.append((shape, first))
-    return pool
+            kept.append((shape, first))
+    return kept
 
 
-def round_half_up(value, places=2):
-    """Round to the given decimals, halves away from zero, like the
-    baseline's JavaScript rounding, and return an int for whole numbers."""
-    scaled = value * (10 ** places)
+def weighted_quantile(pairs, level):
+    """Weighted quantile of (value, weight) pairs at the given level.
+
+    The pairs are sorted by value and the quantile is the first value
+    whose cumulative weight reaches the cutoff -- an actual launch's
+    ratio, not a blend of two. Interpolating between launches was
+    tried and scored worse: a blend can land where no launch ever
+    sat, while the step keeps each quantile on a real observed ratio.
+    """
+    total = sum(weight for _, weight in pairs)
+    if total <= 0:
+        return None
+    cutoff = level * total
+    cumulative = 0.0
+    for value, weight in sorted(pairs):
+        cumulative += weight
+        if cumulative >= cutoff:
+            return value
+    return sorted(pairs)[-1][0]
+
+
+def round_half_up(value):
+    """Round to 2 decimals, halves up; whole numbers come back as ints."""
+    scaled = value * 100
     whole = math.floor(scaled)
     if scaled - whole >= 0.5:
         whole += 1
-    rounded = whole / (10 ** places)
+    rounded = whole / 100
     return int(rounded) if rounded.is_integer() else rounded
 
 
-def forecast_hour(p1, pool, hour, levels):
+def forecast_one_hour(p1, launches, hour, levels):
     """Five quantiles of one hour's viewer count."""
     pairs = []
-    for shape, launch_first in pool:
+    for shape, launch_first in launches:
         if hour not in shape:
             continue
-        distance = abs(math.log(launch_first) - math.log(p1))
-        pairs.append((shape[hour], math.exp(-distance / SIZE_BANDWIDTH)))
+        gap = abs(math.log(launch_first) - math.log(p1))
+        pairs.append((shape[hour], math.exp(-gap / SIZE_SCALE)))
     if pairs:
-        quantiles = []
-        for level in levels:
-            value = weighted_quantile(pairs, level)
-            quantiles.append(p1 * math.exp(value))
+        raw = [p1 * math.exp(weighted_quantile(pairs, level)) for level in levels]
     else:
-        # No launch to learn the shape from: stay at the hour-1 print
-        # with a spread that widens like a random walk over the day.
-        spread = 0.15 * math.sqrt(hour - 1)
-        z_scores = {0.05: -1.645, 0.25: -0.674, 0.5: 0.0, 0.75: 0.674, 0.95: 1.645}
-        quantiles = [p1 * math.exp(z_scores.get(level, 0.0) * spread) for level in levels]
-    # Clamp to the contest's bounds and keep the row non-decreasing.
-    clamped = []
-    previous = 0.0
-    for value in quantiles:
+        # Nothing to learn from: hold at the hour-1 print, spread widening
+        # like a random walk as the day goes on.
+        spread = FALLBACK_SIGMA * math.sqrt(hour - 1)
+        raw = [p1 * math.exp(NORMAL_Q.get(level, 0.0) * spread) for level in levels]
+    cleaned = []
+    floor = 0.0
+    for value in raw:
         value = min(max(value, 1.0), 1_000_000_000.0)
-        value = max(value, previous)
-        clamped.append(round_half_up(value))
-        previous = clamped[-1]
-    return clamped
+        value = max(value, floor)
+        cleaned.append(round_half_up(value))
+        floor = cleaned[-1]
+    return cleaned
 
 
 def forecast_case(case):
-    """Forecast every hour the case asks for, from its hour-1 print."""
+    """Forecast every hour the case asks for, anchored on its hour-1 print."""
     levels = case.get("levels") or [0.05, 0.25, 0.5, 0.75, 0.95]
-    known = next((row for row in case.get("known", []) if row.get("hour") == 1), None)
-    if known is None:
+    first_row = next(
+        (row for row in case.get("known", []) if row.get("hour") == 1), None
+    )
+    if first_row is None:
         raise ValueError("case has no hour-1 print")
-    p1 = max(1.0, float(known["viewers"]))
-    pool = shape_pool(case)
-    rows = []
-    for row in case.get("forecast", []):
-        hour = row["hour"]
-        rows.append({"hour": hour, "q": forecast_hour(p1, pool, hour, levels)})
+    p1 = max(1.0, float(first_row["viewers"]))
+    launches = usable_launches(case)
+    rows = [
+        {"hour": row["hour"], "q": forecast_one_hour(p1, launches, row["hour"], levels)}
+        for row in case.get("forecast", [])
+    ]
     return {"hours": rows}
 
 
@@ -192,8 +189,8 @@ def main():
     for path in sorted(INPUT_DIR.glob("*.in")):
         case = json.loads(path.read_text(encoding="utf-8"))
         forecast = forecast_case(case)
-        out_path = OUTPUT_DIR / (path.stem + ".out")
-        out_path.write_text(json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8")
+        text = json.dumps(forecast, separators=(",", ":")) + "\n"
+        (OUTPUT_DIR / (path.stem + ".out")).write_text(text, encoding="utf-8")
 
 
 if __name__ == "__main__":
